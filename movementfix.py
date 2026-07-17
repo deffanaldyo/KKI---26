@@ -2,23 +2,54 @@ from pymavlink import mavutil
 import time
 
 class Movement:
-    # def __init__(self, connection_string='udpin:0.0.0.0:14551', baud=None):
-    def __init__(self, connection_string='/dev/ttyACM0', baud=115200):
-    # def __init__(self, connection_string='COM7', baud=115200):
-        print(f"[Movement] Menghubungkan ke {connection_string} ...")
-        if baud:
-            self.master = mavutil.mavlink_connection(connection_string, baud=baud)
-        else:
-            self.master = mavutil.mavlink_connection(connection_string)
+    DEFAULT_PORTS = ["/dev/ttyACM0", "/dev/ttyACM1"]
+    SERVO_CHANNEL = 9
+    PWM_OPEN = 1900
+    PWM_CLOSE = 1100
 
-        self.master.wait_heartbeat()
-        print(f"[Movement] Heartbeat diterima (sistem {self.master.target_system}, "
-              f"komponen {self.master.target_component})")
-
+    def __init__(self, connection_string=None, port_list=None, baud=115200, heartbeat_timeout=5):
         self.armed = False
         self.last_yaw = 0
         self.yaw_offset = None
         self.depth_offset = None
+        self._gripper_state = None
+        self._gripper_ready = False
+
+        if connection_string:
+            self._connect(connection_string, baud, heartbeat_timeout)
+        else:
+            if port_list is None:
+                port_list = self.DEFAULT_PORTS
+            self.master = None
+            for port in port_list:
+                try:
+                    print(f"[Movement] Menghubungkan ke {port} ...")
+                    master = mavutil.mavlink_connection(port, baud=baud)
+                    master.wait_heartbeat(timeout=heartbeat_timeout)
+                    print(f"[Movement] Heartbeat diterima di {port} "
+                          f"(sistem {master.target_system}, komponen {master.target_component})")
+                    self.master = master
+                    break
+                except Exception as exc:
+                    print(f"[Movement] Gagal di {port}: {exc}")
+
+            if self.master is None:
+                raise ConnectionError(
+                    "Tidak bisa connect ke Pixhawk! Coba colok ulang USB atau cek port di /dev/ttyACM*"
+                )
+
+    def _connect(self, connection_string, baud, heartbeat_timeout):
+        print(f"[Movement] Menghubungkan ke {connection_string} ...")
+        if connection_string.startswith(("udp", "tcp")):
+            self.master = mavutil.mavlink_connection(connection_string)
+        elif baud:
+            self.master = mavutil.mavlink_connection(connection_string, baud=baud)
+        else:
+            self.master = mavutil.mavlink_connection(connection_string)
+
+        self.master.wait_heartbeat(timeout=heartbeat_timeout)
+        print(f"[Movement] Heartbeat diterima (sistem {self.master.target_system}, "
+              f"komponen {self.master.target_component})")
 
     def _result_name(self, result):
         try:
@@ -127,7 +158,6 @@ class Movement:
         return False
 
     def manual_control(self, vx=0, vy=0, vz=500, yaw=0, buttons=0):
-        # MAVLink manual_control_send secara default menerima urutan x, y, z, r, buttons
         self.master.mav.manual_control_send(
             self.master.target_system,
             vx, vy, vz, yaw, buttons
@@ -290,18 +320,19 @@ class Movement:
         return error
 
     def start(self):
+        self._setup_gripper()
         if not self.set_mode('ALT_HOLD'):
             raise RuntimeError(
                 "Gagal set mode ALT_HOLD. Cek pesan [FC STATUSTEXT] di atas untuk alasannya."
             )
-        # if not self.arm():
-        #     raise RuntimeError(
-        #         "Gagal arm ROV. Cek pesan [FC STATUSTEXT] di atas — biasanya karena "
-        #         "pre-arm check gagal (kompas belum kalibrasi, EKF/GPS belum siap, "
-        #         "RC belum dikalibrasi, atau safety switch belum ditekan). "
-        #         "Bisa juga sementara nonaktifkan pre-arm check dengan set param "
-        #         "ARMING_CHECK=0 di QGroundControl untuk isolasi masalah (jangan pakai saat operasi nyata)."
-        #     )
+        if not self.arm():
+            raise RuntimeError(
+                "Gagal arm ROV. Cek pesan [FC STATUSTEXT] di atas — biasanya karena "
+                "pre-arm check gagal (kompas belum kalibrasi, EKF/GPS belum siap, "
+                "RC belum dikalibrasi, atau safety switch belum ditekan). "
+                "Bisa juga sementara nonaktifkan pre-arm check dengan set param "
+                "ARMING_CHECK=0 di QGroundControl untuk isolasi masalah (jangan pakai saat operasi nyata)."
+            )
         
         self.request_data_stream(10)
         time.sleep(0.5)  # beri waktu FC mulai mengirim stream ATTITUDE & SCALED_PRESSURE2
@@ -327,13 +358,14 @@ class Movement:
             return 0
         return int(max(-max_yaw_rate, min(max_yaw_rate, kp_yaw * error)))
 
-    def rov(self, duration, angle, depth_cm, surge, sway):
-        """Gerak ROV: (waktu, yaw target, depth cm, surge/vx, sway/vy)."""
+    def rov(self, duration, angle, depth_cm, surge, sway, gripper):
+        """Gerak ROV: (waktu, yaw target, depth cm, surge/vx, sway/vy), gripper."""
         print(f"[Movement] ROV: t={duration}s angle={angle}° depth={depth_cm}cm "
-              f"surge={surge} sway={sway}")
+              f"surge={surge} sway={sway} gripper={gripper}")
         start = time.time()
         while time.time() - start < duration:
             current_yaw = self.get_yaw(timeout=0.05)
+            self.set_gripper(gripper)
             self.manual_control(
                 vx=surge,
                 vy=sway,
@@ -351,11 +383,11 @@ class Movement:
         self.stop()
         print("\n[Movement] ROV selesai.")
 
-    def bai(self, duration, angle, depth_cm, surge, sway, droper=0):
-        self.rov(duration, angle, depth_cm, surge, sway)
+    def bai(self, duration, angle, depth_cm, surge, sway, gripper):
+        self.rov(duration, angle, depth_cm, surge, sway, gripper)
 
-    def bairotasi(self, duration, angle, depth_cm, surge=0, sway=0, droper=0):
-        self.rov(duration, angle, depth_cm, surge, sway)
+    def bairotasi(self, duration, angle, depth_cm, surge=0, sway=0, gripper=0):
+        self.rov(duration, angle, depth_cm, surge, sway, gripper)
 
     def cleanup(self):
         self.stop()
@@ -364,7 +396,7 @@ class Movement:
         self.close()
 
     def cruise(self, vx=0, vy=0, target_yaw_deg=None, duration=5,
-               kp_yaw=6, max_yaw_rate=300):
+               kp_yaw=6, max_yaw_rate=300, gripper=0):
 
         if target_yaw_deg is None:
             locked_yaw = self.get_yaw(timeout=2)
@@ -394,6 +426,89 @@ class Movement:
         self.manual_control(vx=0, vy=0, vz=500, yaw=0)
         print("[Movement] Cruise selesai.")
 
+    def _read_param(self, param_name, timeout=3):
+        self.master.mav.param_request_read_send(
+            self.master.target_system,
+            self.master.target_component,
+            param_name.encode(),
+            -1
+        )
+        start = time.time()
+        while time.time() - start < timeout:
+            msg = self.master.recv_match(type='PARAM_VALUE', blocking=True, timeout=1)
+            if msg is None:
+                continue
+            pid = msg.param_id
+            if isinstance(pid, bytes):
+                pid = pid.decode("utf-8", errors="ignore")
+            pid = pid.rstrip("\x00")
+            if pid == param_name:
+                return msg.param_value
+        return None
+
+    def _set_param(self, param_name, value):
+        print(f"[Movement] Set {param_name} = {value}")
+        self.master.mav.param_set_send(
+            self.master.target_system,
+            self.master.target_component,
+            param_name.encode(),
+            value,
+            mavutil.mavlink.MAV_PARAM_TYPE_INT32
+        )
+
+    def _setup_gripper(self):
+        """Disable fungsi bawaan servo channel agar DO_SET_SERVO bisa kontrol gripper."""
+        if self._gripper_ready:
+            return True
+
+        param_name = f"SERVO{self.SERVO_CHANNEL}_FUNCTION"
+        current = self._read_param(param_name)
+        if current == 0:
+            print(f"[Movement] {param_name} sudah 0 (siap kontrol gripper).")
+            self._gripper_ready = True
+            return True
+
+        self._set_param(param_name, 0)
+        time.sleep(2)
+
+        result = self._read_param(param_name)
+        if result == 0:
+            print(f"[Movement] {param_name} = 0 OK")
+            self._gripper_ready = True
+            return True
+
+        print(f"[Movement] PERINGATAN: gagal set {param_name} ke 0 (nilai: {result})")
+        return False
+
+    def set_gripper(self, cmd):
+        """cmd: 1=buka, -1=tutup, 0=diam (netral)."""
+        if not self._gripper_ready:
+            self._setup_gripper()
+
+        if cmd == self._gripper_state:
+            return
+
+        pwm_map = {1: self.PWM_OPEN, -1: self.PWM_CLOSE, 0: 1500}
+        label_map = {1: "membuka gripper", -1: "menutup gripper", 0: "diam"}
+        pwm = pwm_map.get(cmd, 1500)
+        if cmd in label_map:
+            print(label_map[cmd])
+
+        self.master.mav.command_long_send(
+            self.master.target_system,
+            self.master.target_component,
+            mavutil.mavlink.MAV_CMD_DO_SET_SERVO,
+            0,
+            self.SERVO_CHANNEL,
+            pwm,
+            0, 0, 0, 0, 0
+        )
+        self._gripper_state = cmd
+
+    def gripper(self, cmd):
+        self.set_gripper(cmd)
+        return cmd
+    
     def close(self):
         self.master.close()
         print("[Movement] Koneksi ditutup.")
